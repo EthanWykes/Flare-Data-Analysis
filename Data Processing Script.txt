@@ -1,1 +1,331 @@
+# Cells have been seperated by '----------'.
+
+------------------------------------------------------------------------------------------------------------------------------
+#this makes it easier to view the full DataFrame at the end
+
+from IPython.display import display, HTML
+display(HTML("<style>:root { --jp-notebook-max-width: 100% !important; }</style>"))
+
+------------------------------------------------------------------------------------------------------------------------------
+
+# Main Script: be sure to adjust file paths so they work for you
+
+import pandas as pd
+import numpy as np
+import lightkurve as lk
+from astroquery.mast import Catalogs
+from astroquery.simbad import Simbad
+import warnings
+from tqdm import tqdm
+import scipy.constants as sc
+import matplotlib.pyplot as plt
+import re
+
+warnings.filterwarnings("ignore")
+
+# -------------------------------
+# PART 1: Read star data from text file and replace 'PM I' with 'PM J'
+# -------------------------------
+def parse_star_file(filepath):
+    colspecs = [(0, 16), (81, 85), (100, 105)]
+    column_names = ['PM Number', 'Spectral Type', 'Teff']
+    df = pd.read_fwf(filepath, colspecs=colspecs, names=column_names, skiprows=20)
+    df['PM Number'] = df['PM Number'].str.replace('PM I', 'PM J')
+    df = df[pd.to_numeric(df['Teff'], errors='coerce').notnull()]
+    df['Teff'] = df['Teff'].astype(int)
+    df = df[df['Teff'] != 0]
+    return df
+
+filepath = r"C:\Users\ewyke\OneDrive - Northumbria University - Production Azure AD\Level 7\Project KD7030\data files\aj460805t3_mrt.txt"
+df_stars = parse_star_file(filepath)
+df_stars_sorted = df_stars.sort_values(by='Teff', ascending=True).reset_index(drop=True)
+
+pd.set_option('display.max_rows', None)
+pd.set_option('display.max_columns', None)
+
+# -------------------------------
+# PART 2: Light-curve processing and flare detection
+# -------------------------------
+# Updated DataFrame definition with extra columns for TIC Luminosity and the new ratio columns.
+flare_data = pd.DataFrame(columns=[
+    "Star Name", "Flaring Rate (flares/day)", "Flare Duration (mins)",
+    "Flare Rise Time (mins)", "Surface Temperature (K)", "Rotation Period (days)",
+    "Spectral Type", "Star Distance (Pc)", "Star Mass (Msun)", "Star Radius (Rsun)",
+    "Star Luminosity (W)", "Peak Flux", "Flare Area",
+    "Peak Time (days)", "Decay Time (mins)", "TIC Luminosity (W)",
+    "Rise/Dur", "Decay/Dur", "Decay/Rise"
+])
+
+def is_segment_too_noisy(flux, noise_factor=1, outlier_fraction=0.2):
+    median_flux = np.nanmedian(flux)
+    std_flux = np.nanstd(flux)
+    outliers = np.sum((flux > median_flux + noise_factor * std_flux) |
+                      (flux < median_flux - noise_factor * std_flux))
+    return (outliers / len(flux)) > outlier_fraction  
+
+def get_tic_id(name):
+    return int(Catalogs.query_object(name, catalog="TIC")['ID'][0])
+
+def get_star_info(name, star_data):
+    tic_id = get_tic_id(name)
+    tic_results = Catalogs.query_object(f'TIC {tic_id}', catalog='TIC')
+    custom_simbad = Simbad()
+    # Request plx, rot (we're taking luminosity from TIC)
+    custom_simbad.add_votable_fields('plx', 'rot')
+    simbad_results = custom_simbad.query_object(f"TIC {tic_id}")
+
+    mass = tic_results['mass'][0]
+    rad  = tic_results['rad'][0]
+    
+    teff_text  = star_data['Teff']
+    sptype_text = star_data['Spectral Type']
+    
+    # Calculate luminosity from TIC using Stefan-Boltzmann constant.
+    # (Assuming rad is in solar radii; adjust if needed.)
+    calculated_lum = 4 * np.pi * ((rad * (696340000))**2) * sc.Stefan_Boltzmann * teff_text**4
+    
+    if 'mesrot.vsini' in simbad_results.colnames and len(simbad_results['mesrot.vsini']) > 0:
+        rotation_raw = simbad_results['mesrot.vsini'][0]
+    else:
+        rotation_raw = np.nan
+
+    if 'plx_value' in simbad_results.colnames and len(simbad_results['plx_value']) > 0:
+        distance = 1 / (simbad_results['plx_value'][0] / 1000)
+    else:
+        distance = np.nan
+
+    # Get luminosity values from TIC; assume they are in column "lum"
+    if 'lum' in tic_results.colnames and len(tic_results['lum']) > 0:
+        searched_luminosity = np.ma.filled(tic_results['lum'], fill_value=np.nan)
+        luminosity_array = searched_luminosity[~np.isnan(searched_luminosity)]
+        tic_lum = np.median(luminosity_array) * (3.83e26)
+    else:
+        tic_lum = np.nan
+    
+    return (mass, rad, calculated_lum, teff_text, rotation_raw, sptype_text, distance, tic_lum)
+    
+def detect_flares(flux, threshold):
+    flare_candidates = np.where(flux > threshold)[0]
+    flare_events = []
+    if flare_candidates.size > 0:
+        current_flare = [flare_candidates[0]]
+        for i in range(1, len(flare_candidates)):
+            if flare_candidates[i] == flare_candidates[i-1] + 1:
+                current_flare.append(flare_candidates[i])
+            else:
+                flare_events.append(current_flare)
+                current_flare = [flare_candidates[i]]
+        flare_events.append(current_flare)
+    return flare_events
+
+def find_flare_start_end(flux, time, flare_indices):
+    """
+    For each flare event, compute:
+      - Flare duration (mins): from refined start to the time when flux drops below 
+        (baseline + (peak_value - 1)/e),
+      - Flare rise time (mins): from true start to peak,
+      - Peak flux,
+      - Flare area (via trapezoidal integration above the baseline),
+      - Peak time (days),
+      - Decay time (mins): from peak to flare end.
+    This version takes the largest maximum in each flare region.
+    """
+    flare_durations = []
+    flare_rise_times = []
+    flare_peak_values = []
+    flare_areas = []
+    flare_peak_times = []
+    flare_decay_times = []
+
+    for flare in flare_indices:
+        if len(flare) < 2:
+            continue
+        # Determine true flare start
+        start_index = flare[0]
+        while start_index > 0 and flux[start_index - 1] < flux[start_index]:
+            start_index -= 1
+        true_start_time = time[start_index]
+        baseline_flux = flux[start_index]
+        # Take the highest value in the entire flare region
+        flare_arr = np.array(flare)
+        peak_idx_relative = np.argmax(flux[flare_arr])
+        peak_index = flare_arr[peak_idx_relative]
+        peak_value = flux[peak_index]
+        flare_peak_values.append(peak_value)
+        # Record the time of the peak
+        peak_time = time[peak_index]
+        flare_peak_times.append(peak_time)
+        # Calculate rise time (mins): from true start to peak
+        rise_time = (peak_time - true_start_time) * 1440
+        flare_rise_times.append(rise_time)
+        # Refine start for duration measurement
+        start_index = peak_index
+        while start_index > 0 and flux[start_index - 1] < flux[start_index]:
+            start_index -= 1
+        baseline_flux = flux[start_index]
+        # End-of-flare threshold: flux_at_end = baseline + (peak_value - 1)/e
+        flux_at_end = baseline_flux + (peak_value - baseline_flux) / np.e
+        # Iterate from peak until finding the first point below flux_at_end
+        end_index = peak_index
+        while end_index < len(flux) and flux[end_index] >= flux_at_end:
+            end_index += 1
+        if end_index >= len(flux):
+            end_index = len(flux) - 1
+        # Flare duration (mins): from start_index to end_index
+        flare_duration = (time[end_index] - time[start_index]) * 1440
+        flare_durations.append(flare_duration)
+        # Decay time (mins): from peak to end_index
+        decay_time = (time[end_index] - peak_time) * 1440
+        flare_decay_times.append(decay_time)
+        # Flare area above baseline via trapezoidal integration
+        area = np.trapz(flux[start_index:end_index+1] - baseline_flux,
+                        x=time[start_index:end_index+1]) * 1440
+        flare_areas.append(area)
+    return (flare_durations, flare_rise_times, flare_peak_values,
+            flare_areas, flare_peak_times, flare_decay_times)
+
+def process_light_curve(lightcurve, name, star_data):
+    global flare_data
+    std_number = 2.5
+    flat_lc, _ = lightcurve.flatten(window_length=501, return_trend=True, break_tolerance=50)
+    median_full = np.median(flat_lc.flux)
+    std_full = np.nanstd(flat_lc.flux)
+    threshold_full = median_full + std_number * std_full
+
+    time_vals = np.array(flat_lc.time.value, dtype=float)
+    dt = np.diff(time_vals)
+    # Create segments based on every gap >= 0.4 days
+    gap_indices = np.where(dt >= 0.4)[0]
+    segments = []
+    if gap_indices.size > 0:
+        start = 0
+        for gap in gap_indices:
+            segments.append(flat_lc[start:gap+1])
+            start = gap+1
+        segments.append(flat_lc[start:])
+    else:
+        segments = [flat_lc]
+
+    total_flares = 0
+    total_time = 0
+    flare_details = []
+    
+    for seg in segments:
+        seg_time = np.array(seg.time.value, dtype=float)
+        if len(seg_time) < 2:
+            continue
+        seg_duration = seg_time[-1] - seg_time[0]
+        total_time += seg_duration
+        seg_flat, _ = seg.flatten(window_length=501, return_trend=True, break_tolerance=50)
+        if is_segment_too_noisy(seg_flat.flux):
+            continue
+        events = detect_flares(seg_flat.flux, threshold_full)
+        (durations, rise_times, peaks, areas,
+         peak_times, decay_times) = find_flare_start_end(seg_flat.flux, seg_time, events)
+        total_flares += len(durations)
+        for duration, rise_time, peak_value, area, peak_time, decay_time in zip(
+            durations, rise_times, peaks, areas, peak_times, decay_times
+        ):
+            flare_details.append((duration, rise_time, peak_value, area, peak_time, decay_time))
+    
+    flaring_rate = total_flares / total_time if total_time > 0 else 0
+    star_info = get_star_info(name, star_data)
+    if star_info is None:
+        return
+
+    # For each flare, calculate additional ratios:
+    for duration, rise_time, peak_value, area, peak_time, decay_time in flare_details:
+        # Avoid division by zero
+        ratio_rise_dur = rise_time / duration if duration != 0 else np.nan
+        ratio_decay_dur = decay_time / duration if duration != 0 else np.nan
+        ratio_decay_rise = decay_time / rise_time if rise_time != 0 else np.nan
+        
+        new_row = pd.DataFrame([[
+            name,
+            np.round(flaring_rate, 5),
+            np.round(duration, 5),
+            np.round(rise_time, 5),
+            np.round(float(star_info[3]), 5),  # Surface Temperature (K)
+            star_info[4],                     # Rotation Period (days)
+            star_info[5],                     # Spectral Type
+            np.round(float(star_info[6]), 5),
+            np.round(float(star_info[0]), 5),
+            np.round(float(star_info[1]), 5),
+            np.round(float(star_info[2]), 5),
+            np.round(peak_value, 5),
+            np.round(area, 5),
+            np.round(peak_time, 5),           # Peak Time (days)
+            np.round(decay_time, 5),          # Decay Time (mins)
+            np.round(float(star_info[7]), 5),   # TIC Luminosity (W)
+            np.round(ratio_rise_dur, 5),
+            np.round(ratio_decay_dur, 5),
+            np.round(ratio_decay_rise, 5)
+        ]], columns=[
+            "Star Name", "Flaring Rate (flares/day)", "Flare Duration (mins)",
+            "Flare Rise Time (mins)", "Surface Temperature (K)", "Rotation Period (days)",
+            "Spectral Type", "Star Distance (Pc)", "Star Mass (Msun)", "Star Radius (Rsun)",
+            "Star Luminosity (W)", "Peak Flux", "Flare Area", "Peak Time (days)",
+            "Decay Time (mins)", "TIC Luminosity (W)", "Rise/Dur", "Decay/Dur", "Decay/Rise"
+        ])
+        flare_data = pd.concat([flare_data, new_row], ignore_index=True)
+
+from tqdm import tqdm
+
+with tqdm(total=len(df_stars_sorted), desc="Progress", unit=" Stars", colour='blue') as pbar:
+    for idx, row in df_stars_sorted.iterrows():
+        star_name = row['PM Number']
+        try:
+            search_result = lk.search_lightcurve(star_name, author='spoc', exptime=120, mission='tess')
+        except Exception as e:
+            print(f"Error searching for {star_name}: {e}")
+            pbar.update(1)
+            continue
+        if not search_result or len(search_result) == 0:
+            pbar.update(1)
+            continue
+        for result in search_result:
+            pbar.update(np.round(1/len(search_result), 5))
+            try:
+                pre_lc = result.download()
+            except Exception as e:
+                print(f"Error downloading result for {star_name}: {e}")
+                continue
+            if pre_lc is not None:
+                lc = pre_lc.remove_nans()
+                process_light_curve(lc, star_name, row)
+        #break  # Uncomment if you only want to process the first star
+pbar.close()
+
+print("\nFlaring Event Data:")
+pd.set_option("display.width", 1000)
+pd.set_option("display.max_columns", None)
+flare_data
+
+------------------------------------------------------------------------------------------------------------------------------
+
+# Suppose your DataFrame is named 'flare_data'.
+
+# 1) Convert all Quantity columns to floats
+for col in flare_data.columns:
+    # Check if this column has any entries with a .value attribute (typical of Astropy Quantity)
+    if any(hasattr(val, "value") for val in flare_data[col]):
+        # Convert each entry to val.value if it has a .value attribute, otherwise leave it as is
+        flare_data[col] = flare_data[col].apply(
+            lambda x: x.value if hasattr(x, "value") else x
+        )
+
+# 2) Now pickle the cleaned DataFrame
+pickle_path = r"C:\Users\ewyke\OneDrive - Northumbria University - Production Azure AD\Level 7\Project KD7030\data files\cleaned_flare_data.pk"
+flare_data.to_pickle(pickle_path)
+print(f"DataFrame pickled to: {pickle_path}")
+
+------------------------------------------------------------------------------------------------------------------------------
+
+# this just reads back in the generated pickle file to check it's saved properly 
+
+pickle_path = r"C:\Users\ewyke\OneDrive - Northumbria University - Production Azure AD\Level 7\Project KD7030\data files\cleaned_flare_data.pk"
+flare_data1 = pd.read_pickle(pickle_path)
+flare_data1
+
+
 
